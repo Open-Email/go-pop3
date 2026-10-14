@@ -19,6 +19,12 @@ type Server struct {
 	wg       sync.WaitGroup
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	// mu guards conns, the set of live connections the library still owns
+	// (hijacked connections are removed). Close walks it to kick blocked
+	// reads, which context cancellation alone cannot unblock.
+	mu    sync.Mutex
+	conns map[*Conn]struct{}
 }
 
 // New creates a new POP3 server with the given options.
@@ -29,7 +35,20 @@ func New(opts Options) *Server {
 		opts:   resolved,
 		ctx:    ctx,
 		cancel: cancel,
+		conns:  make(map[*Conn]struct{}),
 	}
+}
+
+func (s *Server) registerConn(c *Conn) {
+	s.mu.Lock()
+	s.conns[c] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *Server) unregisterConn(c *Conn) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
 }
 
 // Serve accepts connections on the given listener. It blocks until the
@@ -118,13 +137,20 @@ func (s *Server) ListenAndServeTLS(addr string) error {
 }
 
 // Close gracefully shuts down the server. It closes the listener,
-// cancels all active connections, and waits for them to finish.
+// cancels all active connections — kicking any that are blocked in a read,
+// since context cancellation alone cannot unblock a net.Conn — and waits for
+// them to finish. Hijacked connections are caller-owned and are left untouched.
 func (s *Server) Close() error {
 	s.cancel()
 	var err error
 	if s.listener != nil {
 		err = s.listener.Close()
 	}
+	s.mu.Lock()
+	for c := range s.conns {
+		c.forceReadUnblock()
+	}
+	s.mu.Unlock()
 	s.wg.Wait()
 	return err
 }
@@ -172,6 +198,7 @@ func (s *Server) handleConn(netConn net.Conn) {
 	} else {
 		ctx, cancel = context.WithCancel(s.ctx)
 	}
+	defer cancel()
 
 	// Detect implicit TLS, unwrapping any listener/conn wrappers (e.g. a
 	// PROXY-protocol or throughput-checking wrapper) that embed the tls.Conn
@@ -179,6 +206,7 @@ func (s *Server) handleConn(netConn net.Conn) {
 	// via Conn.SetTLS in NewSession.
 	c := &Conn{
 		netConn:   netConn,
+		rawConn:   netConn,
 		server:    s,
 		reader:    bufio.NewReader(netConn),
 		writer:    s.newWriter(netConn),
@@ -189,6 +217,9 @@ func (s *Server) handleConn(netConn net.Conn) {
 		startTime: time.Now(),
 	}
 
+	s.registerConn(c)
+	defer s.unregisterConn(c)
+
 	// Create the session via the consumer's callback.
 	session, err := s.opts.NewSession(c)
 	if err != nil {
@@ -198,7 +229,6 @@ func (s *Server) handleConn(netConn net.Conn) {
 			s.opts.Logger.Debug("POP3: connection silently rejected",
 				"remote", netConn.RemoteAddr(), "error", err)
 			netConn.Close()
-			cancel()
 			return
 		}
 		s.opts.Logger.Warn("POP3: session creation failed",
@@ -213,7 +243,6 @@ func (s *Server) handleConn(netConn net.Conn) {
 		c.err(msg)
 		c.writer.Flush()
 		netConn.Close()
-		cancel()
 		return
 	}
 
