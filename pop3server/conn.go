@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,19 @@ type Conn struct {
 	state   connState
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	// rawConn is the connection as originally accepted. STLS replaces
+	// netConn with a *tls.Conn that wraps it, but never rawConn, so deadline
+	// operations on rawConn always reach the socket — including from another
+	// goroutine while this one is blocked mid-handshake.
+	rawConn net.Conn
+
+	// deadlineMu serialises read-deadline changes against forceReadUnblock.
+	// Once poisoned is set (server shutdown), no later SetReadDeadline may
+	// re-arm or clear the expired deadline, or a read racing with Close could
+	// block again and outlive Server.Close.
+	deadlineMu sync.Mutex
+	poisoned   bool
 
 	// Pre-auth state for USER/PASS two-step flow.
 	username string
@@ -134,7 +148,9 @@ func (c *Conn) Hijack() (net.Conn, *bufio.Reader, error) {
 	if err := c.writer.Flush(); err != nil {
 		return nil, nil, err
 	}
+	c.setDeadline(time.Time{})
 	c.hijacked = true
+	c.server.unregisterConn(c)
 	return c.netConn, c.reader, nil
 }
 
@@ -152,13 +168,21 @@ func (c *Conn) serve() {
 	}
 
 	for {
+		if c.server.ctx.Err() != nil {
+			return
+		}
+
 		// Set idle timeout for reading the next command.
 		if d := c.nextReadDeadline(); !d.IsZero() {
-			c.netConn.SetReadDeadline(d)
+			c.setReadDeadline(d)
 		}
 
 		line, err := c.readLine()
 		if err != nil {
+			if c.server.ctx.Err() != nil {
+				// Server.Close kicked this connection out of its blocked read.
+				return
+			}
 			if isTimeout(err) {
 				// Distinguish absolute session timeout from idle timeout.
 				if opts.AbsoluteSessionTimeout > 0 && time.Since(c.startTime) >= opts.AbsoluteSessionTimeout {
@@ -186,10 +210,10 @@ func (c *Conn) serve() {
 			return
 		}
 
-		line = strings.TrimSpace(line)
-		if line == "" {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
+		line = strings.TrimLeft(line, " \t")
 
 		// Parse command and arguments. The verb is split from its raw
 		// argument so PASS can recover a password containing runs of
@@ -213,7 +237,7 @@ func (c *Conn) serve() {
 		// Clear the connection deadline during command execution (the
 		// per-command context governs cancellation now). Write deadlines,
 		// when configured, are re-armed per write by writeDeadlineConn.
-		c.netConn.SetDeadline(time.Time{})
+		c.setDeadline(time.Time{})
 
 		c.lastErr = nil
 		start := time.Now()
@@ -253,6 +277,43 @@ func (c *Conn) serve() {
 			return
 		}
 	}
+}
+
+// setReadDeadline arms (or, with the zero Time, clears) the read deadline,
+// unless the connection has been poisoned by server shutdown, in which case
+// the already-expired deadline is left in place so pending and future reads
+// fail immediately.
+func (c *Conn) setReadDeadline(t time.Time) {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if c.poisoned {
+		return
+	}
+	c.netConn.SetReadDeadline(t)
+}
+
+// setDeadline is setReadDeadline's counterpart for the paths that arm both
+// read and write deadlines (the STLS handshake, the per-command clear).
+func (c *Conn) setDeadline(t time.Time) {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if c.poisoned {
+		return
+	}
+	c.netConn.SetDeadline(t)
+}
+
+// forceReadUnblock permanently expires the read deadline. Server.Close uses
+// it to kick a connection out of a blocked read (cancelling a context cannot
+// unblock net.Conn reads); serve then observes the cancelled context and
+// exits. It targets rawConn so the poke reaches the socket even while netConn
+// is being swapped by a STLS upgrade, and it marks the connection poisoned so
+// a SetReadDeadline racing with shutdown cannot re-arm a live deadline.
+func (c *Conn) forceReadUnblock() {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.poisoned = true
+	c.rawConn.SetReadDeadline(time.Now())
 }
 
 // nextReadDeadline computes the read deadline for the next command, honouring
@@ -300,7 +361,7 @@ func (c *Conn) dispatch(ctx context.Context, cmd string, args []string) bool {
 func (c *Conn) dispatchAuth(ctx context.Context, cmd string, args []string) bool {
 	switch cmd {
 	case "CAPA":
-		c.handleCapa()
+		c.handleCapa(args)
 	case "USER":
 		c.handleUser(args)
 	case "PASS":
@@ -308,14 +369,18 @@ func (c *Conn) dispatchAuth(ctx context.Context, cmd string, args []string) bool
 	case "AUTH":
 		c.handleAuth(ctx, args)
 	case "STLS":
-		c.handleSTLS(ctx)
+		c.handleSTLS(ctx, args)
 	case "QUIT":
+		if len(args) > 0 {
+			c.clientError("Syntax: QUIT")
+			return false
+		}
 		c.ok("Goodbye")
 		return true
 	case "UTF8":
 		// RFC 6856 §2: the UTF8 command is only valid in the AUTHORIZATION
 		// state (it must precede the credentials it applies to).
-		c.handleUTF8(ctx)
+		c.handleUTF8(ctx, args)
 	case "LANG":
 		// RFC 6856 §3: LANG is valid in both AUTHORIZATION and TRANSACTION.
 		c.handleLang(ctx, args)
@@ -338,9 +403,9 @@ func (c *Conn) dispatchAuth(ctx context.Context, cmd string, args []string) bool
 func (c *Conn) dispatchTransaction(ctx context.Context, cmd string, args []string) bool {
 	switch cmd {
 	case "CAPA":
-		c.handleCapa()
+		c.handleCapa(args)
 	case "STAT":
-		c.handleStat(ctx)
+		c.handleStat(ctx, args)
 	case "LIST":
 		c.handleList(ctx, args)
 	case "UIDL":
@@ -352,12 +417,11 @@ func (c *Conn) dispatchTransaction(ctx context.Context, cmd string, args []strin
 	case "DELE":
 		c.handleDele(ctx, args)
 	case "RSET":
-		c.handleRset(ctx)
+		c.handleRset(ctx, args)
 	case "NOOP":
-		c.handleNoop(ctx)
+		c.handleNoop(ctx, args)
 	case "QUIT":
-		c.handleQuit(ctx)
-		return true
+		return c.handleQuit(ctx, args)
 	case "LANG":
 		c.handleLang(ctx, args)
 	case "UTF8":
@@ -367,7 +431,15 @@ func (c *Conn) dispatchTransaction(ctx context.Context, cmd string, args []strin
 		// connection and fails the whole download. Large providers accept the
 		// post-auth form for the same reason, so accept it here too — enabling
 		// UTF-8 mid-session only widens what the responses may carry.
-		c.handleUTF8(ctx)
+		c.handleUTF8(ctx, args)
+	case "USER", "PASS", "AUTH":
+		// AUTHORIZATION-state commands after authentication (RFC 1939 §5,
+		// RFC 5034 §4). A known verb in the wrong state is a client protocol
+		// error, not an unknown command.
+		c.clientError("Already authenticated")
+	case "STLS":
+		// RFC 2595 §4: STLS is only valid in AUTHORIZATION state.
+		c.clientError("STLS only allowed before authentication")
 	case "LAST":
 		c.err("LAST is obsolete (RFC 1939)")
 	default:
@@ -418,7 +490,11 @@ func (c *Conn) writeCap(name string, params ...string) {
 	c.writer.WriteString("\r\n")
 }
 
-func (c *Conn) handleCapa() {
+func (c *Conn) handleCapa(args []string) {
+	if len(args) > 0 {
+		c.clientError("Syntax: CAPA")
+		return
+	}
 	opts := c.server.opts
 	authAllowed := opts.InsecureAuth || c.isTLS
 
@@ -467,7 +543,7 @@ func (c *Conn) handleUser(args []string) {
 		c.clientError("Authentication requires TLS. Use STLS first")
 		return
 	}
-	if len(args) < 1 {
+	if len(args) != 1 {
 		c.clientError("Syntax: USER <username>")
 		return
 	}
@@ -532,6 +608,11 @@ func (c *Conn) handleAuth(ctx context.Context, args []string) {
 		return
 	}
 
+	if len(args) > 2 {
+		c.clientError("Syntax: AUTH [mechanism [initial-response]]")
+		return
+	}
+
 	if len(args) < 1 {
 		// AUTH with no args: list mechanisms
 		c.writer.WriteString("+OK\r\n")
@@ -565,10 +646,10 @@ func (c *Conn) handleAuth(ctx context.Context, args []string) {
 		// and then goes silent cannot hold the connection open (pre-auth
 		// slowloris — see E2). The command loop cleared the deadline.
 		if d := c.nextReadDeadline(); !d.IsZero() {
-			c.netConn.SetReadDeadline(d)
+			c.setReadDeadline(d)
 		}
 		line, readErr := c.readLine()
-		c.netConn.SetReadDeadline(time.Time{})
+		c.setReadDeadline(time.Time{})
 		if readErr != nil {
 			// A silent client (or one that dropped) must not linger; tear the
 			// connection down now instead of waiting another idle cycle (E2).
@@ -608,7 +689,11 @@ func (c *Conn) handleAuth(ctx context.Context, args []string) {
 	c.ok("Authentication successful")
 }
 
-func (c *Conn) handleSTLS(ctx context.Context) {
+func (c *Conn) handleSTLS(ctx context.Context, args []string) {
+	if len(args) > 0 {
+		c.clientError("Syntax: STLS")
+		return
+	}
 	opts := c.server.opts
 
 	if c.isTLS {
@@ -645,10 +730,10 @@ func (c *Conn) handleSTLS(ctx context.Context) {
 	// per-command ctx additionally aborts the handshake on server shutdown or
 	// CommandTimeout.
 	if d := c.nextReadDeadline(); !d.IsZero() {
-		c.netConn.SetDeadline(d)
+		c.setDeadline(d)
 	}
 	err := tlsConn.HandshakeContext(ctx)
-	c.netConn.SetDeadline(time.Time{})
+	c.setDeadline(time.Time{})
 	if err != nil {
 		// The peer has already switched to TLS, so no plaintext -ERR can be
 		// delivered; drop the connection rather than looping in a broken state
@@ -669,7 +754,11 @@ func (c *Conn) handleSTLS(ctx context.Context) {
 	c.username = ""
 }
 
-func (c *Conn) handleStat(ctx context.Context) {
+func (c *Conn) handleStat(ctx context.Context, args []string) {
+	if len(args) > 0 {
+		c.clientError("Syntax: STAT")
+		return
+	}
 	count, size, err := c.session.Stat(ctx)
 	if err != nil {
 		c.sessionError(err)
@@ -782,7 +871,7 @@ func (c *Conn) handleRetr(ctx context.Context, args []string) {
 }
 
 func (c *Conn) handleTop(ctx context.Context, args []string) {
-	if len(args) < 2 {
+	if len(args) != 2 {
 		c.clientError("Syntax: TOP <msg> <lines>")
 		return
 	}
@@ -834,7 +923,11 @@ func (c *Conn) handleDele(ctx context.Context, args []string) {
 	c.ok("Message deleted")
 }
 
-func (c *Conn) handleRset(ctx context.Context) {
+func (c *Conn) handleRset(ctx context.Context, args []string) {
+	if len(args) > 0 {
+		c.clientError("Syntax: RSET")
+		return
+	}
 	if err := c.session.Rset(ctx); err != nil {
 		c.sessionError(err)
 		return
@@ -842,7 +935,11 @@ func (c *Conn) handleRset(ctx context.Context) {
 	c.ok("Maildrop has been reset")
 }
 
-func (c *Conn) handleNoop(ctx context.Context) {
+func (c *Conn) handleNoop(ctx context.Context, args []string) {
+	if len(args) > 0 {
+		c.clientError("Syntax: NOOP")
+		return
+	}
 	if err := c.session.Noop(ctx); err != nil {
 		c.sessionError(err)
 		return
@@ -850,23 +947,32 @@ func (c *Conn) handleNoop(ctx context.Context) {
 	c.ok("")
 }
 
-func (c *Conn) handleQuit(ctx context.Context) {
+func (c *Conn) handleQuit(ctx context.Context, args []string) bool {
+	if len(args) > 0 {
+		c.clientError("Syntax: QUIT")
+		return false
+	}
 	expunged, err := c.session.Quit(ctx)
 	if err != nil {
 		c.sessionError(err)
-		return
+		return true
 	}
 	if expunged > 0 {
 		c.writer.WriteString(fmt.Sprintf("+OK %d messages expunged\r\n", expunged))
 	} else {
 		c.ok("Goodbye")
 	}
+	return true
 }
 
 func (c *Conn) handleLang(ctx context.Context, args []string) {
 	lang, ok := c.session.(SessionLang)
 	if !ok {
 		c.clientError("LANG not supported")
+		return
+	}
+	if len(args) > 1 {
+		c.clientError("Syntax: LANG [tag]")
 		return
 	}
 
@@ -894,7 +1000,11 @@ func (c *Conn) handleLang(ctx context.Context, args []string) {
 	fmt.Fprintf(c.writer, "+OK Language set to %s\r\n", sanitizeResponse(tag))
 }
 
-func (c *Conn) handleUTF8(ctx context.Context) {
+func (c *Conn) handleUTF8(ctx context.Context, args []string) {
+	if len(args) > 0 {
+		c.clientError("Syntax: UTF8")
+		return
+	}
 	utf8, ok := c.session.(SessionUTF8)
 	if !ok {
 		c.clientError("UTF8 not supported")
@@ -1072,6 +1182,9 @@ func (c *Conn) parseOptionalMsgNum(args []string) (int, error) {
 func (c *Conn) parseMsgNum(args []string) (int, error) {
 	if len(args) < 1 {
 		return 0, errors.New("message number required")
+	}
+	if len(args) > 1 {
+		return 0, errors.New("too many arguments")
 	}
 	n, err := parseInt(args[0])
 	if err != nil || n < 1 {
